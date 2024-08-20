@@ -12,6 +12,7 @@ xdg-base-dirs = "^6.0.1"
 undetected-chromedriver = "^3.5.3"
 selenium = "<4.13.0"
 python-dotenv = "^1.0.0"
+requests = "^2.32.3"
 
 
 [build-system]
