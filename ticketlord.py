@@ -6,6 +6,7 @@ import os
 import re
 import subprocess
 import time
+from urllib.parse import parse_qs, urlparse
 import uuid
 
 import dotenv
@@ -94,7 +95,7 @@ def extract_cookies(browser):
     }
 
 
-USER_AGENT = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36"
+USER_AGENT = "Mozilla/5.0 (Linux; Android 11; Pixel 5) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/92.0.4515.131 Mobile Safari/537.36"
 
 
 def get_order_history(cookies):
@@ -130,6 +131,7 @@ def select_order(order_history, event_name):
 def poll_until_success(requestor):
     start_time = datetime.now()
     while True:
+        print("wait for polling")
         resp = requestor()
         resp.raise_for_status()
         if resp.status_code == 200:
@@ -141,8 +143,28 @@ def poll_until_success(requestor):
 def get_tickets(order, cookies):
     tickets = {}
     order_id = order["usOrderId"]
-    for event in order["events"]:
-        event_id = event["id"]
+    print("get order info")
+    resp = requests.get(
+        f"https://my.ticketmaster.com/view-order/async/json/order/{order_id}",
+        params={"lang": "en-us"},
+        headers={"user-agent": USER_AGENT},
+        cookies=cookies,
+    )
+    resp.raise_for_status()
+    polling = resp.json()["pollingToken"]
+    resp = poll_until_success(
+        lambda: requests.get(
+            f"https://my.ticketmaster.com/view-order/async/json/order/token/{polling}",
+            headers={"user-agent": USER_AGENT},
+            cookies=cookies,
+        )
+    )
+    assert "items" in resp.json(), resp.json()
+    for item in resp.json()["items"]:
+        assert "viewTickets" in item["_links"], item["_links"].keys()
+        view_link = item["_links"]["viewTickets"]["source"]
+        event_id = parse_qs(urlparse(view_link).query)["eventId"][0]
+        print("get ticket info")
         resp = requests.get(
             f"https://my.ticketmaster.com/deliver-tickets/async/json/order/{order_id}/view",
             params={"eventId": event_id},
@@ -161,6 +183,7 @@ def get_tickets(order, cookies):
         )
         assert "outputs" in resp.json(), resp.json()
         ticket_infos = resp.json()["outputs"]
+        print("get ticket details")
         resp = requests.post(
             f"https://my.ticketmaster.com/deliver-tickets/async/json/order/{order_id}/ret",
             params={"safeTix": "true", "token": polling},
@@ -184,7 +207,7 @@ def get_tickets(order, cookies):
                 cookies=cookies,
             )
         )
-        assert "tokenMap" in resp.json()["responseCode"], resp.json()
+        assert "tokenMap" in resp.json(), resp.json()
         tickets.update(resp.json()["tokenMap"])
     return tickets
 
