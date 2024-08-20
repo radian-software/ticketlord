@@ -6,6 +6,7 @@ import os
 import re
 import subprocess
 import time
+import uuid
 
 import dotenv
 import requests
@@ -32,7 +33,7 @@ def get_chromium_version():
 def create_browser():
     # https://github.com/ultrafunkamsterdam/undetected-chromedriver/issues/491
     opts = uc.ChromeOptions()
-    opts.add_argument("--headless=new")
+    # opts.add_argument("--headless=new")
     browser = uc.Chrome(version_main=get_chromium_version(), options=opts)
     browser.execute_cdp_cmd(
         "Emulation.setDeviceMetricsOverride",
@@ -126,6 +127,17 @@ def select_order(order_history, event_name):
     )
 
 
+def poll_until_success(requestor):
+    start_time = datetime.now()
+    while True:
+        resp = requestor()
+        resp.raise_for_status()
+        if resp.status_code == 200:
+            return resp
+        time.sleep(2)
+        assert (datetime.now() - start_time) < timedelta(seconds=60), "timed out"
+
+
 def get_tickets(order, cookies):
     tickets = {}
     order_id = order["usOrderId"]
@@ -139,19 +151,40 @@ def get_tickets(order, cookies):
         )
         resp.raise_for_status()
         polling = resp.json()["pollingToken"]
-        start_time = datetime.now()
-        while True:
-            resp = requests.get(
-                f"https://my.ticketmaster.com/deliver-tickets/async/json/{order_id}/poll",
+        resp = poll_until_success(
+            lambda: requests.get(
+                f"https://my.ticketmaster.com/deliver-tickets/async/json/order/{order_id}/poll",
                 params={"eventId": event_id, "token": polling},
                 headers={"user-agent": USER_AGENT},
                 cookies=cookies,
             )
-            resp.raise_for_status()
-            if resp.status_code == 200:
-                break
-            time.sleep(2)
-            assert (datetime.now() - start_time) < timedelta(seconds=60), "timed out"
+        )
+        assert "outputs" in resp.json(), resp.json()
+        ticket_infos = resp.json()["outputs"]
+        resp = requests.post(
+            f"https://my.ticketmaster.com/deliver-tickets/async/json/order/{order_id}/ret",
+            params={"safeTix": "true", "token": polling},
+            headers={"user-agent": USER_AGENT},
+            cookies=cookies,
+            json={
+                "deviceId": str(uuid.uuid4()),
+                "deviceOs": "ANDROID",
+                "deviceType": "WEB",
+                "tickets": ticket_infos,
+            },
+        )
+        resp.raise_for_status()
+        polling = resp.json()["pollingToken"]
+        start_time = datetime.now()
+        resp = poll_until_success(
+            lambda: requests.get(
+                f"https://my.ticketmaster.com/deliver-tickets/async/json/{order_id}/ret/poll",
+                params={"token": polling},
+                headers={"user-agent": USER_AGENT},
+                cookies=cookies,
+            )
+        )
+        assert "tokenMap" in resp.json()["responseCode"], resp.json()
         tickets.update(resp.json()["tokenMap"])
     return tickets
 
@@ -161,14 +194,28 @@ parser.add_argument("event_name")
 args = parser.parse_args()
 
 
+print("create browser")
 browser = create_browser()
+
+print("navigate to homepage")
 browser.get("https://www.ticketmaster.com/")
+
+print("click login button")
 click_login_button(browser)
+
+print("fill username and password")
 fill_username_and_password(browser)
+
+print("wait for login to finish")
 wait_for_login_to_finish(browser)
+
+print("navigate to orders page")
+browser.get("https://www.ticketmaster.com/user/orders")
 cookies = extract_cookies(browser)
 
-browser.get("https://www.ticketmaster.com/user/orders")
+print("get order history")
 order_history = get_order_history(cookies)
 order = select_order(order_history, args.event_name)
+
+print("retrieve tickets")
 tickets = get_tickets(order, cookies)
