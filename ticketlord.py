@@ -27,6 +27,21 @@ def get_chromium_version():
     return int(match.group(0))
 
 
+def create_browser():
+    # https://github.com/ultrafunkamsterdam/undetected-chromedriver/issues/491
+    browser = uc.Chrome(version_main=get_chromium_version())
+    browser.execute_cdp_cmd(
+        "Emulation.setDeviceMetricsOverride",
+        {"width": 375, "height": 812, "deviceScaleFactor": 50, "mobile": True},
+    )
+    return browser
+
+
+def click_login_button(browser):
+    span = browser.find_element(By.CSS_SELECTOR, "button[data-testid='accountLink']")
+    span.click()
+
+
 def fill_username_and_password(browser):
     start_time = datetime.now()
     while True:
@@ -57,9 +72,17 @@ def fill_username_and_password(browser):
     login_button.click()
 
 
-browser = uc.Chrome(version_main=get_chromium_version())
-browser.get(
-    "https://auth.ticketmaster.com/as/authorization.oauth2?redirect_uri=psdktm://login&response_type=code&state=2979eb01-b7ee-4954-bc81-8fd82ba31d93&scope=openid%20profile%20phone%20email%20tm%20na&lang=en-us&client_id=ba33f3165c56.android.ticketmaster.us&integratorId=prd300.psdk&placementId=hostOnlyLogin&visualPresets=tm&intSiteToken=tm-us&hideLeftPanel=true&deviceId=554f315b-ba41-41b7-9de5-62a94271c41a"
-)
+def wait_for_login_to_finish(browser):
+    start_time = datetime.now()
+    while True:
+        time.sleep(1)
+        if browser.current_url == "https://www.ticketmaster.com/":
+            break
+        assert (datetime.now() - start_time) < timedelta(seconds=60), "timed out"
 
+
+browser = create_browser()
+browser.get("https://www.ticketmaster.com/")
+click_login_button(browser)
 fill_username_and_password(browser)
+wait_for_login_to_finish(browser)
