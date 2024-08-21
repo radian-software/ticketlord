@@ -1,11 +1,15 @@
 #!/usr/bin/env python3
 
 import argparse
+from contextlib import contextmanager
 from datetime import datetime, timedelta
+import json
 import os
+from pathlib import Path
 import re
 import subprocess
 import time
+import traceback
 from urllib.parse import parse_qs, urlparse
 import uuid
 
@@ -21,6 +25,8 @@ dotenv.load_dotenv()
 TICKETMASTER_EMAIL = os.environ["TICKETMASTER_EMAIL"]
 TICKETMASTER_PASSWORD = os.environ["TICKETMASTER_PASSWORD"]
 
+COOKIES_FILE = Path.home() / ".cache/ticketlord/cookies.json"
+
 
 def get_chromium_version():
     stdout = subprocess.run(
@@ -31,7 +37,21 @@ def get_chromium_version():
     return int(match.group(0))
 
 
-def create_browser():
+def load_cookies():
+    try:
+        with open(COOKIES_FILE) as f:
+            return json.load(f)
+    except FileNotFoundError:
+        return None
+
+
+def save_cookies(cookies):
+    with open(COOKIES_FILE, "w") as f:
+        json.dump(cookies, f, indent=2)
+        f.write("\n")
+
+
+def create_browser(cookies=None):
     # https://github.com/ultrafunkamsterdam/undetected-chromedriver/issues/491
     opts = uc.ChromeOptions()
     # opts.add_argument("--headless=new")
@@ -40,6 +60,10 @@ def create_browser():
         "Emulation.setDeviceMetricsOverride",
         {"width": 375, "height": 812, "deviceScaleFactor": 50, "mobile": True},
     )
+    if cookies:
+        browser.get("https://www.ticketmaster.com/robots.txt")
+        for cookie in cookies:
+            browser.add_cookie(cookie)
     return browser
 
 
@@ -87,15 +111,29 @@ def wait_for_login_to_finish(browser):
         assert (datetime.now() - start_time) < timedelta(seconds=60), "timed out"
 
 
-def extract_cookies(browser):
+def extract_cookies(cookies):
+    if cookies is None:
+        return None
     return {
-        c["name"]: c["value"]
-        for c in browser.get_cookies()
-        if c["domain"] == ".ticketmaster.com"
+        c["name"]: c["value"] for c in cookies if c["domain"] == ".ticketmaster.com"
     }
 
 
 USER_AGENT = "Mozilla/5.0 (Linux; Android 11; Pixel 5) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/92.0.4515.131 Mobile Safari/537.36"
+
+
+def check_authenticated(cookies):
+    resp = requests.get(
+        "https://identity.ticketmaster.com/json/user",
+        params={"hard": "false"},
+        headers={
+            "user-agent": USER_AGENT,
+        },
+        cookies=cookies,
+    )
+    resp.raise_for_status()
+    actual_email = resp.json()["emailAddress"]
+    assert actual_email == TICKETMASTER_EMAIL, actual_email
 
 
 def get_order_history(cookies):
@@ -141,33 +179,13 @@ def poll_until_success(requestor):
 
 
 def get_tickets(order, cookies):
-    tickets = {}
-    order_id = order["usOrderId"]
-    print("get order info")
-    resp = requests.get(
-        f"https://my.ticketmaster.com/view-order/async/json/order/{order_id}",
-        params={"lang": "en-us"},
-        headers={"user-agent": USER_AGENT},
-        cookies=cookies,
-    )
-    resp.raise_for_status()
-    polling = resp.json()["pollingToken"]
-    resp = poll_until_success(
-        lambda: requests.get(
-            f"https://my.ticketmaster.com/view-order/async/json/order/token/{polling}",
-            headers={"user-agent": USER_AGENT},
-            cookies=cookies,
-        )
-    )
-    assert "items" in resp.json(), resp.json()
-    for item in resp.json()["items"]:
-        assert "viewTickets" in item["_links"], item["_links"].keys()
-        view_link = item["_links"]["viewTickets"]["source"]
-        event_id = parse_qs(urlparse(view_link).query)["eventId"][0]
-        print("get ticket info")
+    try:
+        tickets = []
+        order_id = order["usOrderId"]
+        print("get order info")
         resp = requests.get(
-            f"https://my.ticketmaster.com/deliver-tickets/async/json/order/{order_id}/view",
-            params={"eventId": event_id},
+            f"https://my.ticketmaster.com/view-order/async/json/order/{order_id}",
+            params={"lang": "en-us"},
             headers={"user-agent": USER_AGENT},
             cookies=cookies,
         )
@@ -175,51 +193,107 @@ def get_tickets(order, cookies):
         polling = resp.json()["pollingToken"]
         resp = poll_until_success(
             lambda: requests.get(
-                f"https://my.ticketmaster.com/deliver-tickets/async/json/order/{order_id}/poll",
-                params={"eventId": event_id, "token": polling},
+                f"https://my.ticketmaster.com/view-order/async/json/order/token/{polling}",
                 headers={"user-agent": USER_AGENT},
                 cookies=cookies,
             )
         )
-        assert "outputs" in resp.json(), resp.json()
-        ticket_infos = resp.json()["outputs"]
-        print("get ticket details")
-        resp = requests.post(
-            f"https://my.ticketmaster.com/deliver-tickets/async/json/order/{order_id}/ret",
-            params={"safeTix": "true", "token": polling},
-            headers={"user-agent": USER_AGENT},
-            cookies=cookies,
-            json={
-                "deviceId": str(uuid.uuid4()),
-                "deviceOs": "ANDROID",
-                "deviceType": "WEB",
-                "tickets": [
+        assert "items" in resp.json(), resp.json()
+        for item in resp.json()["items"]:
+            assert "viewTickets" in item["_links"], item["_links"].keys()
+            view_link = item["_links"]["viewTickets"]["source"]
+            event_id = parse_qs(urlparse(view_link).query)["eventId"][0]
+            statuses = {
+                ticket["barcode"]: ticket["status"] for ticket in item["tickets"]
+            }
+            print("get ticket info")
+            resp = requests.get(
+                f"https://my.ticketmaster.com/deliver-tickets/async/json/order/{order_id}/view",
+                params={"eventId": event_id},
+                headers={"user-agent": USER_AGENT},
+                cookies=cookies,
+            )
+            resp.raise_for_status()
+            polling = resp.json()["pollingToken"]
+            resp = poll_until_success(
+                lambda: requests.get(
+                    f"https://my.ticketmaster.com/deliver-tickets/async/json/order/{order_id}/poll",
+                    params={"eventId": event_id, "token": polling},
+                    headers={"user-agent": USER_AGENT},
+                    cookies=cookies,
+                )
+            )
+            assert "outputs" in resp.json(), resp.json()
+            ticket_infos = resp.json()["outputs"]
+            ticket_infos_by_barcode = {
+                ticket["data"]["value"]: ticket for ticket in ticket_infos
+            }
+            print("get ticket details")
+            resp = requests.post(
+                f"https://my.ticketmaster.com/deliver-tickets/async/json/order/{order_id}/ret",
+                params={"safeTix": "true", "token": polling},
+                headers={"user-agent": USER_AGENT},
+                cookies=cookies,
+                json={
+                    "deviceId": str(uuid.uuid4()),
+                    "deviceOs": "ANDROID",
+                    "deviceType": "WEB",
+                    "tickets": [
+                        {
+                            "barcode": ticket["data"]["value"],
+                            "eventId": ticket["eventId"],
+                            "generalAdmission": ticket["data"]["generalAdmission"],
+                            "row": ticket["data"]["row"],
+                            "seat": ticket["data"]["seat"],
+                            "section": ticket["data"]["section"],
+                        }
+                        for ticket in ticket_infos
+                    ],
+                },
+            )
+            resp.raise_for_status()
+            polling = resp.json()["pollingToken"]
+            start_time = datetime.now()
+            resp = poll_until_success(
+                lambda: requests.get(
+                    f"https://my.ticketmaster.com/deliver-tickets/async/json/{order_id}/ret/poll",
+                    params={"token": polling},
+                    headers={"user-agent": USER_AGENT},
+                    cookies=cookies,
+                )
+            )
+            assert "tokenMap" in resp.json(), resp.json()
+            token_map = resp.json()["tokenMap"]
+            for barcode, status in statuses.items():
+                tickets.append(
                     {
-                        "barcode": ticket["data"]["value"],
-                        "eventId": ticket["eventId"],
-                        "generalAdmission": ticket["data"]["generalAdmission"],
-                        "row": ticket["data"]["row"],
-                        "seat": ticket["data"]["seat"],
-                        "section": ticket["data"]["section"],
+                        "ticketId": barcode,
+                        **token_map[barcode + "e"],
+                        **ticket_infos_by_barcode[barcode + "e"],
+                        "status": status,
                     }
-                    for ticket in ticket_infos
-                ],
-            },
-        )
-        resp.raise_for_status()
-        polling = resp.json()["pollingToken"]
-        start_time = datetime.now()
-        resp = poll_until_success(
-            lambda: requests.get(
-                f"https://my.ticketmaster.com/deliver-tickets/async/json/{order_id}/ret/poll",
-                params={"token": polling},
-                headers={"user-agent": USER_AGENT},
-                cookies=cookies,
-            )
-        )
-        assert "tokenMap" in resp.json(), resp.json()
-        tickets.update(resp.json()["tokenMap"])
+                )
+    except Exception:
+        traceback.print_exc()
+        import pdb
+
+        pdb.set_trace()
     return tickets
+
+
+def display_tickets(tickets):
+    for idx, ticket in enumerate(tickets, start=1):
+        print()
+        print(f"TICKET #{idx} ID :: {ticket['ticketId']} :: STATUS={ticket['status']}")
+        print()
+        for text in ticket["data"]["texts"]:
+            print(text)
+        print()
+        print(
+            f"Section {ticket['data']['section']}, Row {ticket['data']['row']}, Seat {ticket['data']['seat']}"
+        )
+        print()
+        print(f"Rotating barcode token: {ticket['barcode']}")
 
 
 parser = argparse.ArgumentParser()
@@ -227,24 +301,43 @@ parser.add_argument("event_name")
 args = parser.parse_args()
 
 
-print("create browser")
-browser = create_browser()
+print("load cookies")
+raw_cookies = load_cookies()
+cookies = extract_cookies(raw_cookies)
 
-print("navigate to homepage")
-browser.get("https://www.ticketmaster.com/")
 
-print("click login button")
-click_login_button(browser)
+try:
 
-print("fill username and password")
-fill_username_and_password(browser)
+    print("check authentication")
+    check_authenticated(cookies)
 
-print("wait for login to finish")
-wait_for_login_to_finish(browser)
+except Exception:
 
-print("navigate to orders page")
-browser.get("https://www.ticketmaster.com/user/orders")
-cookies = extract_cookies(browser)
+    print("create browser")
+    browser = create_browser(cookies)
+
+    print("navigate to homepage")
+    browser.get("https://www.ticketmaster.com/")
+
+    print("click login button")
+    click_login_button(browser)
+
+    print("fill username and password")
+    fill_username_and_password(browser)
+
+    print("wait for login to finish")
+    wait_for_login_to_finish(browser)
+
+    print("navigate to orders page")
+    browser.get("https://www.ticketmaster.com/user/orders")
+
+    print("save cookies")
+    raw_cookies = browser.get_cookies()
+    cookies = extract_cookies(raw_cookies)
+    save_cookies(raw_cookies)
+
+    print("recheck authentication")
+    check_authenticated(cookies)
 
 print("get order history")
 order_history = get_order_history(cookies)
@@ -252,3 +345,6 @@ order = select_order(order_history, args.event_name)
 
 print("retrieve tickets")
 tickets = get_tickets(order, cookies)
+
+print("display tickets")
+display_tickets(tickets)
