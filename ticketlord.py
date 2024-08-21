@@ -193,7 +193,17 @@ def get_tickets(order, cookies):
                 "deviceId": str(uuid.uuid4()),
                 "deviceOs": "ANDROID",
                 "deviceType": "WEB",
-                "tickets": ticket_infos,
+                "tickets": [
+                    {
+                        "barcode": ticket["data"]["value"],
+                        "eventId": ticket["eventId"],
+                        "generalAdmission": ticket["data"]["generalAdmission"],
+                        "row": ticket["data"]["row"],
+                        "seat": ticket["data"]["seat"],
+                        "section": ticket["data"]["section"],
+                    }
+                    for ticket in ticket_infos
+                ],
             },
         )
         resp.raise_for_status()
