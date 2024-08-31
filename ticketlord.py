@@ -202,7 +202,11 @@ def get_tickets_info(order_item, cookies):
     assert "viewTickets" in order_item["_links"], order_item["_links"].keys()
     view_link = order_item["_links"]["viewTickets"]["source"]
     event_id = parse_qs(urlparse(view_link).query)["eventId"][0]
-    statuses = {ticket["barcode"]: ticket["status"] for ticket in order_item["tickets"]}
+    statuses = {
+        ticket["barcode"]: ticket["status"]
+        for ticket in order_item["tickets"]
+        if ticket.get("barcode")
+    }
     resp = requests.get(
         f"https://my.ticketmaster.com/deliver-tickets/async/json/order/{order_id}/view",
         params={"eventId": event_id},
