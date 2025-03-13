@@ -40,14 +40,25 @@ def get_chromium_version():
 def load_cookies():
     try:
         with open(COOKIES_FILE) as f:
-            return json.load(f)
+            data = json.load(f)
     except FileNotFoundError:
         return None
+    if datetime.now() - datetime.fromtimestamp(data["timestamp"]) > timedelta(days=1):
+        return None
+    return data["cookies"]
 
 
 def save_cookies(cookies):
+    COOKIES_FILE.parent.mkdir(parents=True, exist_ok=True)
     with open(COOKIES_FILE, "w") as f:
-        json.dump(cookies, f, indent=2)
+        json.dump(
+            {
+                "cookies": cookies,
+                "timestamp": int(datetime.now().timestamp()),
+            },
+            f,
+            indent=2,
+        )
         f.write("\n")
 
 
