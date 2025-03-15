@@ -1,0 +1,6 @@
+[Desktop Entry]
+Version=1.0
+Name=Ticketlord PSDKTM Callback
+Type=Application
+Exec=sh -c "printf %%s $0 > /tmp/ticketlord-psdktm.dat" %u
+MimeType=x-scheme-handler/psdktm;
